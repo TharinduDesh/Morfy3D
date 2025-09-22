@@ -247,7 +247,7 @@ with gr.Blocks(
     
     # Header Section with modern styling
     with gr.Row(elem_classes="main-header"):
-        gr.Markdown(
+        gr.Markdown( 
             """
             # 🚀 Morfy AI - Neural 3D Generator
             
@@ -255,7 +255,7 @@ with gr.Blocks(
             
             <div style="display: flex; align-items: center; justify-content: center; margin: 1rem 0;">
                 <span class="status-indicator"></span>
-                <strong>Powered by Hunyuan3D • CPU Optimized • Real-time Processing</strong>
+                <strong>• CPU Optimized • Real-time Processing</strong>
             </div>
             
             Upload any image and watch AI create a detailed 3D model in minutes. Perfect for game development, 
