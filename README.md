@@ -1,6 +1,6 @@
 <p align="center">
 <!-- You can replace this with a custom logo image if you create one -->
-<img src="https://imgur.com/gallery/morfylogo-ivZf7fO#U539doJ" width="200">
+<img src="https://i.imgur.com/U539doJ.png" width="200">
 </p>
 
 <h1 align="center">🤖 Morfy: AI 3D Model Generator</h1>
@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-<img src="https://imgur.com/a/morfy-4EYHJS3" width="800">
+<img src="https://i.imgur.com/45uFcZj.png" width="800">
 <br>
 
 </p>
