@@ -1,3 +1,4 @@
+
 import gradio as gr
 import trimesh
 import os
@@ -8,8 +9,11 @@ import torch
 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dgen.rembg import BackgroundRemover
 
-# NEW: Occlusion Sensitivity XAI
+# XAI: Occlusion Sensitivity
 from xai_occlusion import occlusion_sensitivity_heatmap
+
+# Stage-02: Refinement + Dimension Scaling
+from stage2_refine import refine_mesh, scale_mesh_to_dimensions
 
 # --- Global Variables ---
 SAVE_DIR = "output"
@@ -70,7 +74,6 @@ def preprocess_image(input_image: Image.Image) -> Image.Image:
     if input_image is None:
         raise gr.Error("Please upload an image first.")
 
-    # --- Pre-processing: Background Removal ---
     print("Processing image...")
     try:
         if rmbg_worker is not None:
@@ -89,19 +92,11 @@ def preprocess_image(input_image: Image.Image) -> Image.Image:
 
 
 def _unwrap_mesh(output_list):
-    """
-    Your pipeline annotation says List[List[trimesh.Trimesh]], but some versions return [mesh].
-    This makes it robust.
-    """
     out0 = output_list[0]
     return out0[0] if isinstance(out0, list) else out0
 
 
 def generate_mesh_from_pil(pil_img: Image.Image, fast: bool = False, seed: int = 0) -> trimesh.Trimesh:
-    """
-    PIL.Image -> trimesh.Trimesh
-    fast=True uses cheaper settings for XAI occlusion runs (many repeated calls).
-    """
     if pipeline is None:
         raise gr.Error("Model could not be loaded. Cannot generate.")
     if pil_img is None:
@@ -110,7 +105,6 @@ def generate_mesh_from_pil(pil_img: Image.Image, fast: bool = False, seed: int =
     temp_input_path = "temp_input.png"
     pil_img.save(temp_input_path)
 
-    # Deterministic generator for comparable occlusion runs
     device = pipeline.device if hasattr(pipeline, "device") else "cuda"
     g = torch.Generator(device=device).manual_seed(int(seed))
 
@@ -135,8 +129,7 @@ def generate_mesh_from_pil(pil_img: Image.Image, fast: bool = False, seed: int =
             output_type="trimesh",
         )
 
-    mesh = _unwrap_mesh(output_list)
-    return mesh
+    return _unwrap_mesh(output_list)
 
 
 # --- 2. Generation Function ---
@@ -147,6 +140,15 @@ def generate_and_cache_model(
     xai_mode,
     xai_max_cells,
     xai_patch_scale,
+    enable_stage2,
+    stage2_strength,
+    enable_dim,
+    dim_units,
+    dim_keep_aspect,
+    dim_align_bed,
+    dim_w,
+    dim_l,
+    dim_h,
 ):
     global generated_mesh_cache
 
@@ -157,19 +159,58 @@ def generate_and_cache_model(
 
     processed_image = preprocess_image(input_image)
 
-    print(f"Starting 3D shape generation... (XAI Enabled: {enable_xai})")
+    print(
+        f"Starting 3D shape generation... "
+        f"(XAI: {enable_xai}, Stage-02: {enable_stage2}, Dimensions: {enable_dim})"
+    )
 
-    # 1) Always generate once for the main output (QUALITY)
+    # Stage-01: main output (quality)
     mesh = generate_mesh_from_pil(processed_image, fast=False, seed=0)
-    print("Generation complete.")
+    print("Stage-01 generation complete.")
 
+    # Stage-02: refinement
+    if enable_stage2:
+        try:
+            lvl = int(stage2_strength)
+            print(f"Stage-02 refining... strength={lvl}")
+            mesh = refine_mesh(mesh, strength=lvl, enable_smoothing=True)
+            print("Stage-02 refinement complete.")
+        except Exception as e:
+            print(f"Stage-02 refinement failed: {e}")
+
+    # Stage-02: scale to exact dimensions (3D printing)
+    if enable_dim:
+        try:
+            # Convert gradio Number inputs (can be None) safely
+            w = float(dim_w) if dim_w not in (None, "", 0) else None
+            l = float(dim_l) if dim_l not in (None, "", 0) else None
+            h = float(dim_h) if dim_h not in (None, "", 0) else None
+
+            print(
+                f"Scaling to dimensions (units={dim_units}, keep_aspect={dim_keep_aspect}, align_bed={dim_align_bed}) "
+                f"W={w}, L={l}, H={h}"
+            )
+            mesh = scale_mesh_to_dimensions(
+                mesh,
+                target_w=w,
+                target_l=l,
+                target_h=h,
+                units=str(dim_units),
+                keep_aspect=bool(dim_keep_aspect),
+                align_to_bed=bool(dim_align_bed),
+            )
+            print("Dimension scaling complete.")
+        except Exception as e:
+            print(f"Dimension scaling failed: {e}")
+
+    # Save viewer model
     viewer_save_folder = gen_save_folder()
     viewer_model_path = export_mesh_file(mesh, viewer_save_folder, file_type="glb", base_name="viewer_model")
 
     generated_mesh_cache["mesh"] = mesh
     print("Mesh cached in memory for export.")
 
-    # 2) XAI (Occlusion Sensitivity Heatmap)
+    # XAI (Occlusion Sensitivity Heatmap)
     heatmap_image = None
     if enable_xai:
         try:
@@ -178,11 +219,8 @@ def generate_and_cache_model(
             patch_scale = float(xai_patch_scale)
             mode = str(xai_mode)
 
-            print(
-                f"Running XAI occlusion... grid={grid}, max_cells={max_cells}, mode={mode}, patch_scale={patch_scale}"
-            )
+            print(f"Running XAI occlusion... grid={grid}, max_cells={max_cells}, mode={mode}, patch_scale={patch_scale}")
 
-            # FAST generator for occlusion runs
             def _xai_generate_mesh(img_pil: Image.Image) -> trimesh.Trimesh:
                 return generate_mesh_from_pil(img_pil, fast=True, seed=0)
 
@@ -201,7 +239,6 @@ def generate_and_cache_model(
             print(f"XAI heatmap failed: {e}")
             heatmap_image = None
 
-    # Return: Model Path, Enable Export Btn, Disable Download Btn, Heatmap Image
     return viewer_model_path, gr.update(interactive=True), gr.update(value=None, interactive=False), heatmap_image
 
 
@@ -267,20 +304,39 @@ with gr.Blocks(
         # Input Section
         with gr.Column(scale=1, elem_classes="input-card"):
             gr.Markdown("### 📸 **Input Image**")
-            input_image = gr.Image(
-                type="pil",
-                label="Upload",
-                elem_classes="image-container",
-                height=300,
-                show_label=False,
-            )
+            input_image = gr.Image(type="pil", label="Upload", elem_classes="image-container", height=300, show_label=False)
 
+            # Stage-02 Refinement
+            stage2_checkbox = gr.Checkbox(
+                label="Enable Stage-02 Refinement",
+                value=True,
+                info="Cleans mesh + fixes normals + applies smoothing to improve surface quality.",
+            )
+            stage2_strength = gr.Slider(0, 3, value=2, step=1, label="Refinement strength (0–3)")
+
+            # 3D Printing Dimensions (NEW)
+            with gr.Accordion("📏 3D Printing Dimensions (Exact Size)", open=False):
+                dim_enable = gr.Checkbox(label="Scale model to exact dimensions", value=False)
+                dim_units = gr.Dropdown(choices=["mm", "cm", "in"], value="mm", label="Units")
+                dim_keep_aspect = gr.Checkbox(label="Keep proportions (uniform scale)", value=True)
+                dim_align_bed = gr.Checkbox(label="Align model to print bed (Z=0)", value=True)
+
+                with gr.Row():
+                    dim_w = gr.Number(value=None, label="Width (X)")
+                    dim_l = gr.Number(value=None, label="Length/Depth (Y)")
+                    dim_h = gr.Number(value=None, label="Height (Z)")
+
+                gr.Markdown(
+                    "Tip: Set **Height (Z)** only (e.g., 120mm) to scale uniformly. "
+                    "If you turn off **Keep proportions**, X/Y/Z will scale independently (may distort)."
+                )
+
+            # XAI
             xai_checkbox = gr.Checkbox(
                 label="Enable Explainable AI (Occlusion Heatmap)",
                 value=False,
                 info="Runs multiple fast generations to estimate which image regions influence the 3D output.",
             )
-
             with gr.Accordion("🧠 XAI Settings (Occlusion)", open=False):
                 xai_grid = gr.Slider(4, 12, value=8, step=1, label="Grid size (NxN)")
                 xai_mode = gr.Dropdown(choices=["blur", "gray"], value="blur", label="Occlusion mode")
@@ -291,29 +347,15 @@ with gr.Blocks(
 
             with gr.Group(elem_classes="examples-section"):
                 gr.Markdown("### 💡 **Examples**")
-                gr.Examples(
-                    examples=[["input/demo.png"], ["input/demo2.png"]],
-                    inputs=input_image,
-                    label="",
-                )
+                gr.Examples(examples=[["input/demo.png"], ["input/demo2.png"]], inputs=input_image, label="")
 
         # Output Section
         with gr.Column(scale=1, elem_classes="output-card"):
             with gr.Tabs():
                 with gr.Tab("Generated 3D Model"):
-                    output_model_viewer = gr.Model3D(
-                        label="3D Viewer",
-                        elem_classes="model3d-container",
-                        height=400,
-                        show_label=False,
-                    )
-
+                    output_model_viewer = gr.Model3D(label="3D Viewer", elem_classes="model3d-container", height=400, show_label=False)
                 with gr.Tab("XAI Heatmap"):
-                    xai_heatmap_output = gr.Image(
-                        label="Occlusion Sensitivity",
-                        show_label=False,
-                        height=400,
-                    )
+                    xai_heatmap_output = gr.Image(label="Occlusion Sensitivity", show_label=False, height=400)
 
             gr.Markdown("### 💾 **Export Model**")
             with gr.Row():
@@ -326,6 +368,7 @@ with gr.Blocks(
         gr.Markdown(
             "### 🔧 Technical Specifications\n"
             "- **Model:** Hunyuan3D-2mini\n"
+            "- **Stage-02:** Mesh refinement + optional exact-dimension scaling for 3D printing\n"
             "- **XAI:** Occlusion Sensitivity Heatmap (model-agnostic)\n"
             "- **Metric:** Mesh change via Chamfer distance on sampled surface points\n"
             "- **XAI speed-up:** Uses fewer diffusion steps and lower octree resolution during occlusion runs"
@@ -334,10 +377,25 @@ with gr.Blocks(
     with gr.Row(elem_classes="footer-section"):
         gr.Markdown("### 🏗️ **Morfy** - Next-Generation AI 3D Generation Platform")
 
-    # Event Handlers
     generate_button.click(
         fn=generate_and_cache_model,
-        inputs=[input_image, xai_checkbox, xai_grid, xai_mode, xai_max_cells, xai_patch_scale],
+        inputs=[
+            input_image,
+            xai_checkbox,
+            xai_grid,
+            xai_mode,
+            xai_max_cells,
+            xai_patch_scale,
+            stage2_checkbox,
+            stage2_strength,
+            dim_enable,
+            dim_units,
+            dim_keep_aspect,
+            dim_align_bed,
+            dim_w,
+            dim_l,
+            dim_h,
+        ],
         outputs=[output_model_viewer, export_button, download_button, xai_heatmap_output],
     )
 
