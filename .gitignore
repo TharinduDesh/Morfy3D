@@ -171,3 +171,5 @@ gradio_cache/
 output/
 input/
 temp_input.png
+
+models/

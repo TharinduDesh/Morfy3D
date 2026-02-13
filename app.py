@@ -1,10 +1,10 @@
-
 import gradio as gr
 import trimesh
 import os
 import uuid
 from PIL import Image
 import torch
+import numpy as np
 
 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dgen.rembg import BackgroundRemover
@@ -15,13 +15,20 @@ from xai_occlusion import occlusion_sensitivity_heatmap
 # Stage-02: Refinement + Dimension Scaling
 from stage2_refine import refine_mesh, scale_mesh_to_dimensions
 
-# --- Global Variables ---
+
+# =========================
+# Global Variables
+# =========================
 SAVE_DIR = "output"
 os.makedirs(SAVE_DIR, exist_ok=True)
-
 SUPPORTED_FORMATS = ["glb", "obj", "ply", "stl"]
 
-# --- 1. Load the Models ---
+generated_mesh_cache = {"mesh": None}
+
+
+# =========================
+# 1) Load Models
+# =========================
 print("Loading the 3D generation model...")
 try:
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
@@ -42,7 +49,55 @@ except Exception as e:
     rmbg_worker = None
 
 
-# --- Helper Functions ---
+# --- Sketch-to-Image (Optional / Safe) ---
+sketch_pipe = None
+print("Loading Sketch-to-Image (SDXL + T2I-Adapter, local files)...")
+
+try:
+    # Guarded import: app still launches even if diffusers isn't installed
+    from diffusers import StableDiffusionXLAdapterPipeline, T2IAdapter, EulerAncestralDiscreteScheduler
+
+    # Local adapter folder path
+    adapter_path = "models/t2i-adapter-sketch-sdxl"
+    adapter = T2IAdapter.from_pretrained(
+        adapter_path,
+        torch_dtype=torch.float16,
+        local_files_only=True,
+    )
+
+    # Local SDXL single file
+    base_model_path = "models/sd_xl_base_1.0_0.9vae.safetensors"
+    sketch_pipe = StableDiffusionXLAdapterPipeline.from_single_file(
+        base_model_path,
+        adapter=adapter,
+        torch_dtype=torch.float16,
+        local_files_only=True,
+    )
+
+    sketch_pipe.enable_attention_slicing()
+    sketch_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(sketch_pipe.scheduler.config)
+
+    # Essential for 8GB VRAM GPUs
+    sketch_pipe.enable_model_cpu_offload()
+
+    print("Sketch-to-Image models loaded successfully.")
+except Exception as e:
+    print(f"Sketch-to-Image not available: {e}")
+    sketch_pipe = None
+
+
+# =========================
+# Helper Functions
+# =========================
+def load_css(file_path="style.css"):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        print(f"Warning: Could not load CSS file: {e}")
+        return ""
+
+
 def gen_save_folder(base_dir=SAVE_DIR):
     new_folder_name = str(uuid.uuid4())
     new_folder_path = os.path.join(base_dir, new_folder_name)
@@ -66,11 +121,8 @@ def export_mesh_file(mesh, save_folder, file_type="glb", base_name="generated_mo
         raise
 
 
-# --- Cache for Generated Mesh ---
-generated_mesh_cache = {"mesh": None}
-
-
 def preprocess_image(input_image: Image.Image) -> Image.Image:
+    """For 3D model input images (upload or sketch-refined)."""
     if input_image is None:
         raise gr.Error("Please upload an image first.")
 
@@ -132,9 +184,141 @@ def generate_mesh_from_pil(pil_img: Image.Image, fast: bool = False, seed: int =
     return _unwrap_mesh(output_list)
 
 
-# --- 2. Generation Function ---
+# =========================
+# Sketch preprocessing (robust)
+# =========================
+def normalize_sketch_for_adapter_robust(img: Image.Image) -> Image.Image:
+    """
+    Robust sketch normalization to what the adapter expects:
+      - Black background
+      - White strokes/lines
+    Handles: black-on-white paper, pencil/gray lines, inverted (white-on-black), noisy photos.
+    Output: RGB.
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    arr = np.array(img).astype(np.uint8)
+    gray = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).astype(np.uint8)
+
+    # Contrast stretch (helps faint pencil strokes)
+    gmin, gmax = int(gray.min()), int(gray.max())
+    if gmax > gmin:
+        gray = ((gray - gmin) * (255.0 / (gmax - gmin))).clip(0, 255).astype(np.uint8)
+
+    # Percentile-based thresholds
+    p10 = int(np.percentile(gray, 10))
+    p90 = int(np.percentile(gray, 90))
+
+    # Candidate masks: dark strokes vs light strokes
+    dark_strokes = gray < max(35, p10 + 18)
+    light_strokes = gray > min(220, p90 - 18)
+
+    dark_ratio = float(dark_strokes.mean())
+    light_ratio = float(light_strokes.mean())
+
+    def score(r: float) -> float:
+        # Prefer sparse-ish lines, reject empty or filled
+        if r < 0.002:
+            return 0.0
+        if r > 0.55:
+            return 0.0
+        # peak around ~8% coverage
+        return float(np.exp(-((r - 0.08) ** 2) / (2 * (0.06 ** 2))))
+
+    use_dark = score(dark_ratio) >= score(light_ratio)
+    line_mask = dark_strokes if use_dark else light_strokes
+
+    out = np.zeros((gray.shape[0], gray.shape[1], 3), dtype=np.uint8)
+    out[line_mask] = 255
+    return Image.fromarray(out, mode="RGB")
+
+
+# =========================
+# Sketch-to-Image (Sketchpad)
+# =========================
+def process_sketch_to_preview(sketch_data, prompt):
+    """Convert a sketchpad drawing to a refined image using SDXL + T2I-Adapter."""
+    if sketch_pipe is None:
+        raise gr.Error("Sketch-to-Image model not loaded. Check diffusers install + model paths in /models.")
+    if not prompt:
+        raise gr.Error("Please provide a prompt to guide the sketch conversion.")
+    if sketch_data is None:
+        raise gr.Error("Please draw something first.")
+
+    try:
+        # Sketchpad may return PIL directly OR dict with "composite"
+        if isinstance(sketch_data, dict) and "composite" in sketch_data:
+            sketch_img = sketch_data["composite"]
+        elif isinstance(sketch_data, Image.Image):
+            sketch_img = sketch_data
+        else:
+            raise gr.Error("Sketch data format not supported. Try drawing again.")
+
+        sketch_img = sketch_img.convert("RGB")
+        sketch_for_adapter = normalize_sketch_for_adapter_robust(sketch_img)
+
+        print(f"Refining sketchpad sketch with prompt: '{prompt}'")
+        refined_image = sketch_pipe(
+            prompt=prompt + ", 3d model style, high quality",
+            image=sketch_for_adapter,
+            num_inference_steps=25,
+            guidance_scale=7.5,
+        ).images[0]
+
+        print("Sketchpad refinement complete.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return refined_image
+
+    except Exception as e:
+        print(f"Error in sketchpad processing: {e}")
+        raise gr.Error(f"Sketch processing failed: {e}")
+
+
+# =========================
+# Sketch-to-Image (Uploaded sketch image)
+# =========================
+def process_uploaded_sketch_to_preview(sketch_image, prompt):
+    """Convert an uploaded sketch image to a refined image using SDXL + T2I-Adapter."""
+    if sketch_pipe is None:
+        raise gr.Error("Sketch-to-Image model not loaded. Check diffusers install + model paths in /models.")
+    if sketch_image is None:
+        raise gr.Error("Please upload a sketch image first.")
+    if not prompt:
+        raise gr.Error("Please provide a prompt to guide the sketch conversion.")
+
+    try:
+        sketch_img = sketch_image.convert("RGB")
+        sketch_for_adapter = normalize_sketch_for_adapter_robust(sketch_img)
+
+        print(f"Refining uploaded sketch with prompt: '{prompt}'")
+        refined_image = sketch_pipe(
+            prompt=prompt + ", 3d model style, high quality",
+            image=sketch_for_adapter,
+            num_inference_steps=25,
+            guidance_scale=7.5,
+        ).images[0]
+
+        print("Uploaded sketch refinement complete.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return refined_image
+
+    except Exception as e:
+        print(f"Error in uploaded sketch processing: {e}")
+        raise gr.Error(f"Uploaded sketch processing failed: {e}")
+
+
+# =========================
+# 2) Generation Function
+# =========================
 def generate_and_cache_model(
     input_image,
+    sketchpad_preview_image,        # refined image from sketchpad
+    uploaded_sketch_preview_image,  # refined image from uploaded sketch
     enable_xai,
     xai_grid,
     xai_mode,
@@ -154,21 +338,34 @@ def generate_and_cache_model(
 
     if pipeline is None:
         raise gr.Error("Model could not be loaded. Cannot generate.")
-    if input_image is None:
-        raise gr.Error("Please upload an image first.")
 
-    processed_image = preprocess_image(input_image)
+    # Choose image source priority:
+    # 1) uploaded sketch refined preview
+    # 2) sketchpad refined preview
+    # 3) normal uploaded image
+    final_input = (
+        uploaded_sketch_preview_image
+        if uploaded_sketch_preview_image is not None
+        else sketchpad_preview_image
+        if sketchpad_preview_image is not None
+        else input_image
+    )
+
+    if final_input is None:
+        raise gr.Error("Please upload an image OR generate a sketch preview first.")
+
+    processed_image = preprocess_image(final_input)
 
     print(
         f"Starting 3D shape generation... "
         f"(XAI: {enable_xai}, Stage-02: {enable_stage2}, Dimensions: {enable_dim})"
     )
 
-    # Stage-01: main output (quality)
+    # Stage-01
     mesh = generate_mesh_from_pil(processed_image, fast=False, seed=0)
     print("Stage-01 generation complete.")
 
-    # Stage-02: refinement
+    # Stage-02 refinement
     if enable_stage2:
         try:
             lvl = int(stage2_strength)
@@ -178,10 +375,9 @@ def generate_and_cache_model(
         except Exception as e:
             print(f"Stage-02 refinement failed: {e}")
 
-    # Stage-02: scale to exact dimensions (3D printing)
+    # Exact dimension scaling
     if enable_dim:
         try:
-            # Convert gradio Number inputs (can be None) safely
             w = float(dim_w) if dim_w not in (None, "", 0) else None
             l = float(dim_l) if dim_l not in (None, "", 0) else None
             h = float(dim_h) if dim_h not in (None, "", 0) else None
@@ -207,10 +403,11 @@ def generate_and_cache_model(
     viewer_save_folder = gen_save_folder()
     viewer_model_path = export_mesh_file(mesh, viewer_save_folder, file_type="glb", base_name="viewer_model")
 
+    # Cache mesh
     generated_mesh_cache["mesh"] = mesh
     print("Mesh cached in memory for export.")
 
-    # XAI (Occlusion Sensitivity Heatmap)
+    # XAI heatmap
     heatmap_image = None
     if enable_xai:
         try:
@@ -242,7 +439,9 @@ def generate_and_cache_model(
     return viewer_model_path, gr.update(interactive=True), gr.update(value=None, interactive=False), heatmap_image
 
 
-# --- 3. Export Function ---
+# =========================
+# 3) Export Function
+# =========================
 def export_cached_model(export_format):
     global generated_mesh_cache
     mesh = generated_mesh_cache.get("mesh")
@@ -262,19 +461,11 @@ def export_cached_model(export_format):
         return gr.update(value=None, interactive=False)
 
 
-# --- 4. Load External CSS ---
-def load_css(file_path="style.css"):
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        print(f"Warning: Could not load CSS file: {e}")
-        return ""
-
-
+# =========================
+# 4) Gradio UI
+# =========================
 custom_css = load_css()
 
-# --- 5. Create and Launch Interface ---
 print("Launching Enhanced Morfy interface...")
 
 with gr.Blocks(
@@ -295,7 +486,7 @@ with gr.Blocks(
             <h3 style="text-align: center;">Transform 2D Images into Stunning 3D Models</h3>
             <div style="display: flex; align-items: center; justify-content: center; margin: 2rem 0;">
                 <span class="status-indicator"></span>
-                <strong style="color: rgba(255, 255, 255, 0.9); font-size: 1.05rem;">AI-Powered • Real-time Processing • Explainable AI</strong>
+                <strong style="color: rgba(255, 255, 255, 0.9); font-size: 1.05rem;">AI-Powered • Real-time Processing • Explainable AI • Sketch-to-3D</strong>
             </div>
             """
         )
@@ -303,8 +494,37 @@ with gr.Blocks(
     with gr.Row(equal_height=True):
         # Input Section
         with gr.Column(scale=1, elem_classes="input-card"):
-            gr.Markdown("### 📸 **Input Image**")
-            input_image = gr.Image(type="pil", label="Upload", elem_classes="image-container", height=300, show_label=False)
+
+            with gr.Tabs() as input_tabs:
+                with gr.Tab("📸 Image Upload", id="tab_upload"):
+                    input_image = gr.Image(type="pil", label="Upload Image", elem_classes="image-container", height=300)
+
+                with gr.Tab("🎨 Sketch to Image", id="tab_sketch"):
+                    sketch_prompt = gr.Textbox(label="Describe Sketch", placeholder="e.g. A wooden chair, a sports car")
+
+                    with gr.Row(equal_height=True):
+                        sketch_pad = gr.Sketchpad(type="pil", label="Draw Here", elem_classes="sketch-canvas", scale=1)
+                        sketch_preview_out = gr.Image(type="pil", label="Refined Image Preview", interactive=False, scale=1)
+
+                    sketch_preview_btn = gr.Button("🔍 1. Refine Sketch to Image", variant="secondary")
+
+                    if sketch_pipe is None:
+                        gr.Markdown(
+                            "⚠️ **Sketch-to-Image not loaded.**\n\n"
+                            "Check that `diffusers` is installed and your local model files exist in the `models/` folder."
+                        )
+
+                with gr.Tab("🖼️ Upload Sketch Image", id="tab_sketch_upload"):
+                    sketch_upload = gr.Image(type="pil", label="Upload Sketch Image", elem_classes="image-container", height=300)
+                    sketch_upload_prompt = gr.Textbox(label="Describe Sketch", placeholder="e.g. A wooden chair, a sports car")
+                    sketch_upload_preview_out = gr.Image(type="pil", label="Refined Image Preview", interactive=False, height=300)
+                    sketch_upload_preview_btn = gr.Button("🔍 1. Refine Uploaded Sketch", variant="secondary")
+
+                    if sketch_pipe is None:
+                        gr.Markdown(
+                            "⚠️ **Sketch-to-Image not loaded.**\n\n"
+                            "Check that `diffusers` is installed and your local model files exist in the `models/` folder."
+                        )
 
             # Stage-02 Refinement
             stage2_checkbox = gr.Checkbox(
@@ -314,7 +534,7 @@ with gr.Blocks(
             )
             stage2_strength = gr.Slider(0, 3, value=2, step=1, label="Refinement strength (0–3)")
 
-            # 3D Printing Dimensions (NEW)
+            # 3D Printing Dimensions
             with gr.Accordion("📏 3D Printing Dimensions (Exact Size)", open=False):
                 dim_enable = gr.Checkbox(label="Scale model to exact dimensions", value=False)
                 dim_units = gr.Dropdown(choices=["mm", "cm", "in"], value="mm", label="Units")
@@ -343,7 +563,7 @@ with gr.Blocks(
                 xai_max_cells = gr.Slider(4, 64, value=16, step=1, label="Max occlusion cells (speed control)")
                 xai_patch_scale = gr.Slider(1.0, 2.0, value=1.2, step=0.1, label="Patch scale")
 
-            generate_button = gr.Button("✨ Generate 3D Model", variant="primary", size="lg")
+            generate_button = gr.Button("🚀 2. Generate 3D Model", variant="primary", size="lg")
 
             with gr.Group(elem_classes="examples-section"):
                 gr.Markdown("### 💡 **Examples**")
@@ -353,7 +573,12 @@ with gr.Blocks(
         with gr.Column(scale=1, elem_classes="output-card"):
             with gr.Tabs():
                 with gr.Tab("Generated 3D Model"):
-                    output_model_viewer = gr.Model3D(label="3D Viewer", elem_classes="model3d-container", height=400, show_label=False)
+                    output_model_viewer = gr.Model3D(
+                        label="3D Viewer",
+                        elem_classes="model3d-container",
+                        height=400,
+                        show_label=False,
+                    )
                 with gr.Tab("XAI Heatmap"):
                     xai_heatmap_output = gr.Image(label="Occlusion Sensitivity", show_label=False, height=400)
 
@@ -368,19 +593,34 @@ with gr.Blocks(
         gr.Markdown(
             "### 🔧 Technical Specifications\n"
             "- **Model:** Hunyuan3D-2mini\n"
+            "- **Sketch-to-Image:** SDXL + T2I-Adapter (local files, sketch normalized to white-on-black)\n"
             "- **Stage-02:** Mesh refinement + optional exact-dimension scaling for 3D printing\n"
             "- **XAI:** Occlusion Sensitivity Heatmap (model-agnostic)\n"
-            "- **Metric:** Mesh change via Chamfer distance on sampled surface points\n"
             "- **XAI speed-up:** Uses fewer diffusion steps and lower octree resolution during occlusion runs"
         )
 
     with gr.Row(elem_classes="footer-section"):
         gr.Markdown("### 🏗️ **Morfy** - Next-Generation AI 3D Generation Platform")
 
+    # --- EVENTS ---
+    sketch_preview_btn.click(
+        fn=process_sketch_to_preview,
+        inputs=[sketch_pad, sketch_prompt],
+        outputs=[sketch_preview_out],
+    )
+
+    sketch_upload_preview_btn.click(
+        fn=process_uploaded_sketch_to_preview,
+        inputs=[sketch_upload, sketch_upload_prompt],
+        outputs=[sketch_upload_preview_out],
+    )
+
     generate_button.click(
         fn=generate_and_cache_model,
         inputs=[
             input_image,
+            sketch_preview_out,
+            sketch_upload_preview_out,
             xai_checkbox,
             xai_grid,
             xai_mode,
@@ -404,6 +644,7 @@ with gr.Blocks(
         inputs=[export_format_dropdown],
         outputs=[download_button],
     )
+
 
 if __name__ == "__main__":
     morfy_app.launch(share=False, inbrowser=True, server_name="0.0.0.0", server_port=7860)
