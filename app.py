@@ -185,7 +185,7 @@ def generate_mesh_from_pil(pil_img: Image.Image, fast: bool = False, seed: int =
 
 
 # =========================
-# Sketch preprocessing (robust)
+# Sketch preprocessing 
 # =========================
 def normalize_sketch_for_adapter_robust(img: Image.Image) -> Image.Image:
     """
