@@ -645,6 +645,12 @@ with gr.Blocks(
         outputs=[download_button],
     )
 
+    export_format_dropdown.change(
+        fn=export_cached_model,
+        inputs=[export_format_dropdown],
+        outputs=[download_button],
+    )
+
 
 if __name__ == "__main__":
     morfy_app.launch(share=False, inbrowser=True, server_name="0.0.0.0", server_port=7860)
