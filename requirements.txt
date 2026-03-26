@@ -41,3 +41,8 @@ controlnet-aux
 #gevent
 #geventhttpclient
 
+#XAI
+scikit-image
+scipy
+captum
+

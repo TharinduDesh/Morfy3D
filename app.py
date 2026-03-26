@@ -185,7 +185,7 @@ def generate_mesh_from_pil(pil_img: Image.Image, fast: bool = False, seed: int =
 
 
 # =========================
-# Sketch preprocessing 
+# Sketch preprocessing
 # =========================
 def normalize_sketch_for_adapter_robust(img: Image.Image) -> Image.Image:
     """
@@ -320,7 +320,10 @@ def generate_and_cache_model(
     sketchpad_preview_image,        # refined image from sketchpad
     uploaded_sketch_preview_image,  # refined image from uploaded sketch
     enable_xai,
+    xai_method,
     xai_grid,
+    xai_segments,
+    xai_compactness,
     xai_mode,
     xai_max_cells,
     xai_patch_scale,
@@ -409,34 +412,68 @@ def generate_and_cache_model(
 
     # XAI heatmap
     heatmap_image = None
+    xai_summary = ""
+    xai_table = []
+
     if enable_xai:
         try:
+            method = str(xai_method)
             grid = int(xai_grid)
+            n_segments = int(xai_segments)
+            compactness = float(xai_compactness)
             max_cells = int(xai_max_cells)
-            patch_scale = float(xai_patch_scale)
             mode = str(xai_mode)
+            patch_scale = float(xai_patch_scale)  # kept for UI compatibility
 
-            print(f"Running XAI occlusion... grid={grid}, max_cells={max_cells}, mode={mode}, patch_scale={patch_scale}")
+            print(
+                f"Running XAI occlusion... "
+                f"method={method}, grid={grid}, n_segments={n_segments}, "
+                f"compactness={compactness}, max_cells={max_cells}, mode={mode}, patch_scale={patch_scale}"
+            )
 
             def _xai_generate_mesh(img_pil: Image.Image) -> trimesh.Trimesh:
                 return generate_mesh_from_pil(img_pil, fast=True, seed=0)
 
-            heatmap_image, _scores = occlusion_sensitivity_heatmap(
+            xai_result = occlusion_sensitivity_heatmap(
                 input_img=processed_image,
                 generate_mesh_from_pil=_xai_generate_mesh,
+                method=method,
                 grid=grid,
+                n_segments=n_segments,
+                compactness=compactness,
                 occlusion_mode=mode,
-                patch_scale=patch_scale,
-                max_cells=max_cells,
+                max_regions=max_cells,
                 n_samples=1024,
                 seed=0,
             )
+
+            heatmap_image = xai_result["overlay"]
+
+            faith = xai_result.get("faithfulness", {})
+            xai_summary = (
+                f"Top-k mesh change: {faith.get('topk_mesh_change', 0.0):.4f}\n"
+                f"Bottom-k mesh change: {faith.get('bottomk_mesh_change', 0.0):.4f}\n"
+                f"Faithfulness gap: {faith.get('faithfulness_gap', 0.0):.4f}"
+            )
+
+            top_regions = xai_result.get("ranked_regions", [])[:5]
+            xai_table = [[int(r.region_id), round(float(r.score), 4), int(r.area)] for r in top_regions]
+
             print("XAI heatmap generation complete.")
         except Exception as e:
             print(f"XAI heatmap failed: {e}")
             heatmap_image = None
+            xai_summary = f"XAI failed: {e}"
+            xai_table = []
 
-    return viewer_model_path, gr.update(interactive=True), gr.update(value=None, interactive=False), heatmap_image
+    return (
+        viewer_model_path,
+        gr.update(interactive=True),
+        gr.update(value=None, interactive=False),
+        heatmap_image,
+        xai_summary,
+        xai_table,
+    )
 
 
 # =========================
@@ -482,7 +519,7 @@ with gr.Blocks(
     with gr.Row(elem_classes="main-header"):
         gr.Markdown(
             """
-            # <span style="font-size: 4rem; font-weight: 900; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">✨ Morfy</span>
+            # <span style="display: block; text-align: center; font-size: 4rem; font-weight: 900; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">✨ Morfy ✨</span>
             <h3 style="text-align: center;">Transform 2D Images into Stunning 3D Models</h3>
             <div style="display: flex; align-items: center; justify-content: center; margin: 2rem 0;">
                 <span class="status-indicator"></span>
@@ -558,8 +595,15 @@ with gr.Blocks(
                 info="Runs multiple fast generations to estimate which image regions influence the 3D output.",
             )
             with gr.Accordion("🧠 XAI Settings (Occlusion)", open=False):
+                xai_method = gr.Dropdown(
+                    choices=["superpixel", "grid"],
+                    value="superpixel",
+                    label="Explanation region type",
+                )
                 xai_grid = gr.Slider(4, 12, value=8, step=1, label="Grid size (NxN)")
-                xai_mode = gr.Dropdown(choices=["blur", "gray"], value="blur", label="Occlusion mode")
+                xai_segments = gr.Slider(12, 80, value=36, step=1, label="Number of superpixels")
+                xai_compactness = gr.Slider(1, 30, value=10, step=1, label="Superpixel compactness")
+                xai_mode = gr.Dropdown(choices=["blur", "gray", "mean"], value="blur", label="Occlusion mode")
                 xai_max_cells = gr.Slider(4, 64, value=16, step=1, label="Max occlusion cells (speed control)")
                 xai_patch_scale = gr.Slider(1.0, 2.0, value=1.2, step=0.1, label="Patch scale")
 
@@ -581,6 +625,13 @@ with gr.Blocks(
                     )
                 with gr.Tab("XAI Heatmap"):
                     xai_heatmap_output = gr.Image(label="Occlusion Sensitivity", show_label=False, height=400)
+                    xai_summary_output = gr.Textbox(label="Faithfulness Summary", interactive=False)
+                    xai_table_output = gr.Dataframe(
+                        headers=["Region ID", "Score", "Area"],
+                        datatype=["number", "number", "number"],
+                        label="Top Important Regions",
+                        interactive=False,
+                    )
 
             gr.Markdown("### 💾 **Export Model**")
             with gr.Row():
@@ -622,7 +673,10 @@ with gr.Blocks(
             sketch_preview_out,
             sketch_upload_preview_out,
             xai_checkbox,
+            xai_method,
             xai_grid,
+            xai_segments,
+            xai_compactness,
             xai_mode,
             xai_max_cells,
             xai_patch_scale,
@@ -636,7 +690,14 @@ with gr.Blocks(
             dim_l,
             dim_h,
         ],
-        outputs=[output_model_viewer, export_button, download_button, xai_heatmap_output],
+        outputs=[
+            output_model_viewer,
+            export_button,
+            download_button,
+            xai_heatmap_output,
+            xai_summary_output,
+            xai_table_output,
+        ],
     )
 
     export_button.click(
